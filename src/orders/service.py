@@ -30,7 +30,7 @@ from .domain import (
     scoped_idempotency_key,
     validate_idempotency_key,
 )
-from .ports import CancelResult, DeadLetterQueue, OrderStore, Queue, ReserveResult, TransientStoreError
+from .ports import CancelResult, DeadLetterQueue, DlqMessage, OrderStore, Queue, ReserveResult, TransientStoreError
 
 log = logging.getLogger(__name__)
 
@@ -91,6 +91,9 @@ class ReplayReport:
     replayed: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)  # deleted from DLQ, order already settled
     inspected: list[str] = field(default_factory=list)
+
+
+_REPORT_FIELD = {"replay": "replayed", "skip_settled": "skipped", "inspect": "inspected"}
 
 
 class OrderService:
@@ -229,12 +232,7 @@ class OrderService:
             raise ValueError("operator and reason are required for an auditable replay")
         report = ReplayReport(dry_run=dry_run)
         for msg in dlq.receive(max_messages):
-            body_sha = hashlib.sha256(json.dumps(msg.body, sort_keys=True).encode()).hexdigest()
-            order_id = msg.body.get("order_id")
-            order = self.store.get_order(order_id) if isinstance(order_id, str) else None
-            status = order.status.value if order else None
-            settled = order is not None and order.status is not Status.PENDING
-            decision = "inspect" if dry_run else ("skip_settled" if settled else "replay")
+            decision = self._replay_decision(msg, dry_run)
             self._audit(
                 "replay",
                 decision.upper(),
@@ -242,21 +240,28 @@ class OrderService:
                 operator=operator,
                 reason=reason,
                 message_id=msg.message_id,
-                body_sha256=body_sha,
+                body_sha256=hashlib.sha256(json.dumps(msg.body, sort_keys=True).encode()).hexdigest(),
                 receive_count=msg.receive_count,
-                order_id=order_id,
-                order_status=status,
+                order_id=msg.body.get("order_id"),
+                order_status=self._order_status(msg.body.get("order_id")),
             )
-            if dry_run:
-                report.inspected.append(msg.message_id)
-                continue
-            if not settled:
+            getattr(report, _REPORT_FIELD[decision]).append(msg.message_id)
+            if decision == "replay":
                 self.queue.send({**msg.body, "replay_of": msg.message_id})
-                report.replayed.append(msg.message_id)
-            else:
-                report.skipped.append(msg.message_id)
-            dlq.delete(msg.receipt)
+            if decision != "inspect":
+                dlq.delete(msg.receipt)
         return report
+
+    def _replay_decision(self, msg: DlqMessage, dry_run: bool) -> str:
+        if dry_run:
+            return "inspect"
+        status = self._order_status(msg.body.get("order_id"))
+        settled = status is not None and status != Status.PENDING.value
+        return "skip_settled" if settled else "replay"
+
+    def _order_status(self, order_id: object) -> str | None:
+        order = self.store.get_order(order_id) if isinstance(order_id, str) else None
+        return order.status.value if order else None
 
     def reconcile_undispatched(self, older_than_s: int = 300, limit: int = 1000) -> list[str]:
         """Backstop for the commit-then-enqueue gap: send orders whose message may never have left.

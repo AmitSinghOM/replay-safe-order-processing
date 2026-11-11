@@ -10,6 +10,7 @@ import enum
 import hashlib
 import json
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 MAX_LINES = 10  # keeps one reservation inside a single DynamoDB transaction (limit 100 items)
@@ -90,27 +91,12 @@ class OrderRequest:
     def parse(cls, body: object) -> OrderRequest:
         if not isinstance(body, dict):
             raise ValidationError("body must be a JSON object")
-        customer_id = body.get("customer_id")
-        if not isinstance(customer_id, str) or not 1 <= len(customer_id) <= 64:
-            raise ValidationError("customer_id must be a string of 1-64 characters")
         raw_lines = body.get("lines")
         if not isinstance(raw_lines, list) or not 1 <= len(raw_lines) <= MAX_LINES:
             raise ValidationError(f"lines must be a list of 1-{MAX_LINES} items")
-        merged: dict[str, int] = {}
-        for raw in raw_lines:
-            if not isinstance(raw, dict):
-                raise ValidationError("each line must be an object")
-            sku, qty = raw.get("sku"), raw.get("qty")
-            if not isinstance(sku, str) or not _SKU_RE.match(sku):
-                raise ValidationError(f"invalid sku: {sku!r}")
-            if not isinstance(qty, int) or isinstance(qty, bool) or not 1 <= qty <= MAX_QTY:
-                raise ValidationError(f"qty must be an integer 1-{MAX_QTY}")
-            # A transaction may touch an item only once, so duplicate SKUs are merged.
-            merged[sku] = merged.get(sku, 0) + qty
-        if any(q > MAX_QTY for q in merged.values()):
-            raise ValidationError(f"total qty per sku must be <= {MAX_QTY}")
-        lines = tuple(Line(sku, qty) for sku, qty in sorted(merged.items()))
-        return cls(customer_id=customer_id, lines=lines)
+        return cls(
+            customer_id=_parse_customer_id(body.get("customer_id")), lines=_merge_lines(map(_parse_line, raw_lines))
+        )
 
     def fingerprint(self) -> str:
         """Stable hash of the normalized request, stored with the idempotency key."""
@@ -120,6 +106,33 @@ class OrderRequest:
             sort_keys=True,
         )
         return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _parse_customer_id(value: object) -> str:
+    if not isinstance(value, str) or not 1 <= len(value) <= 64:
+        raise ValidationError("customer_id must be a string of 1-64 characters")
+    return value
+
+
+def _parse_line(raw: object) -> Line:
+    if not isinstance(raw, dict):
+        raise ValidationError("each line must be an object")
+    sku, qty = raw.get("sku"), raw.get("qty")
+    if not isinstance(sku, str) or not _SKU_RE.match(sku):
+        raise ValidationError(f"invalid sku: {sku!r}")
+    if not isinstance(qty, int) or isinstance(qty, bool) or not 1 <= qty <= MAX_QTY:
+        raise ValidationError(f"qty must be an integer 1-{MAX_QTY}")
+    return Line(sku, qty)
+
+
+def _merge_lines(lines: Iterable[Line]) -> tuple[Line, ...]:
+    """A transaction may touch an item only once, so duplicate SKUs are merged and sorted."""
+    merged: dict[str, int] = {}
+    for line in lines:
+        merged[line.sku] = merged.get(line.sku, 0) + line.qty
+    if any(q > MAX_QTY for q in merged.values()):
+        raise ValidationError(f"total qty per sku must be <= {MAX_QTY}")
+    return tuple(Line(sku, qty) for sku, qty in sorted(merged.items()))
 
 
 def validate_idempotency_key(key: object) -> str:

@@ -18,6 +18,8 @@ import csv
 import json
 import math
 import pathlib
+import time
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
 
 
@@ -138,14 +140,24 @@ def evaluate(
     model_tolerance: float | None,
 ) -> tuple[Verdict, float | None]:
     v = Verdict()
+    t_rec = recovered_at(samples, after=0.0)
+    _check_samples(v, samples, t_rec, min_run_seconds)
+    _check_invariants(v, s, obs)
+    if model_tolerance is not None:
+        _check_model(v, p, t_rec, model_tolerance)
+    return v, t_rec
+
+
+def _check_samples(v: Verdict, samples: list[Sample], t_rec: float | None, min_run_seconds: float) -> None:
     duration = samples[-1].t if samples else 0.0
     v.add("min_run_length", duration >= min_run_seconds, f"{duration:.1f}s >= {min_run_seconds:.1f}s")
     errors = sum(1 for x in samples if x.error)
     v.add("sample_errors", errors == 0, f"{errors} failed samples")
     v.add("backlog_seen", any(x.backlog > 0 for x in samples), "backlog was non-zero at some point")
-
-    t_rec = recovered_at(samples, after=0.0)
     v.add("drained", t_rec is not None, f"recovered at {t_rec:.2f}s" if t_rec is not None else "never drained")
+
+
+def _check_invariants(v: Verdict, s: Scenario, obs: Observed) -> None:
     v.add("no_pending_orders", obs.orders_pending == 0, f"{obs.orders_pending} still PENDING")
     v.add(
         "all_orders_reserved",
@@ -164,51 +176,109 @@ def evaluate(
         1 <= obs.max_concurrency <= s.concurrency,  # < 1 means not measured: fail, don't pass vacuously
         f"max {obs.max_concurrency} <= cap {s.concurrency}",
     )
-    if model_tolerance is not None and t_rec is not None and math.isfinite(p.recovery_seconds):
-        ratio = t_rec / p.recovery_seconds if p.recovery_seconds > 0 else math.inf
-        ok = (1 - model_tolerance) <= ratio <= (1 + model_tolerance)
-        v.add("matches_model", ok, f"measured/predicted = {ratio:.2f} (tolerance +/-{model_tolerance:.0%})")
-    return v, t_rec
+
+
+def _check_model(v: Verdict, p: Prediction, t_rec: float | None, tolerance: float) -> None:
+    if t_rec is None or not math.isfinite(p.recovery_seconds):
+        return
+    ratio = t_rec / p.recovery_seconds if p.recovery_seconds > 0 else math.inf
+    ok = (1 - tolerance) <= ratio <= (1 + tolerance)
+    v.add("matches_model", ok, f"measured/predicted = {ratio:.2f} (tolerance +/-{tolerance:.0%})")
+
+
+def count_statuses(statuses: Iterable[object], pending: object, reserved: object) -> tuple[int, int, int]:
+    """(pending, reserved, other) counts; the runners pass Status.PENDING / Status.RESERVED."""
+    counts = [0, 0, 0]
+    for st in statuses:
+        counts[0 if st is pending else 1 if st is reserved else 2] += 1
+    return counts[0], counts[1], counts[2]
+
+
+def sample_until_drained(
+    read: Callable[[], tuple[int, int, int]],
+    *,
+    t0: float,
+    arrivals_done: Callable[[], bool],
+    sample_every: float,
+    max_seconds: float,
+    zero_streak_needed: int = 3,
+    on_sample: Callable[[Sample], None] | None = None,
+) -> list[Sample]:
+    """Poll ``read`` -> (visible, in_flight, dlq) until the backlog stays at zero after arrivals end.
+
+    A failed read is recorded as an error sample (and counted by ``evaluate``), never dropped.
+    """
+    samples: list[Sample] = []
+    zero_streak = 0
+    while True:
+        t = time.monotonic() - t0
+        try:
+            visible, in_flight, dlq = read()
+            sample = Sample(t, visible, in_flight, dlq)
+            zero_streak = zero_streak + 1 if (visible + in_flight == 0 and arrivals_done()) else 0
+        except Exception as exc:  # cqa: ignore=PY-COR-002 reason="recorded as a failing sample"
+            sample = Sample(t, 0, 0, 0, error=f"{type(exc).__name__}: {exc}")
+            zero_streak = 0
+        samples.append(sample)
+        if on_sample:
+            on_sample(sample)
+        if zero_streak >= zero_streak_needed or t > max_seconds:
+            return samples
+        time.sleep(sample_every)
+
+
+# ---- rendering and results ---------------------------------------------------
+
+_W, _H, _PAD = 720, 360, 50
 
 
 def render_svg(samples: list[Sample], s: Scenario, p: Prediction, t_rec: float | None, title: str) -> str:
     """Dependency-free line chart: measured backlog vs model."""
-    w, h, pad = 720, 360, 50
     good = [x for x in samples if x.error is None]
     t_max = max([x.t for x in good] + [p.recovery_seconds if math.isfinite(p.recovery_seconds) else 0, 1])
     b_max = max([x.backlog for x in good] + [p.peak_backlog, 1])
 
     def xy(t: float, b: float) -> tuple[float, float]:
-        return pad + (w - 2 * pad) * t / t_max, h - pad - (h - 2 * pad) * b / b_max
+        return _PAD + (_W - 2 * _PAD) * t / t_max, _H - _PAD - (_H - 2 * _PAD) * b / b_max
 
-    measured = " ".join(f"{a:.1f},{b:.1f}" for a, b in (xy(x.t, x.backlog) for x in good))
-    model_pts = _model_points(s, p, t_max)
-    model = " ".join(f"{a:.1f},{b:.1f}" for a, b in (xy(t, b) for t, b in model_pts))
-    rec = ""
-    if t_rec is not None:
-        rx, _ = xy(t_rec, 0)
-        rec = (
-            f'<line x1="{rx:.1f}" y1="{pad}" x2="{rx:.1f}" y2="{h - pad}" stroke="#888" stroke-dasharray="2,3"/>'
-            f'<text x="{rx + 4:.1f}" y="{pad + 12}" font-size="11">recovered {t_rec:.0f}s</text>'
-        )
-    return f"""<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" font-family="sans-serif" role="img"
+    measured = _polyline(((x.t, x.backlog) for x in good), xy)
+    model = _polyline(_model_points(s, p, t_max), xy)
+    marker = _recovery_marker(t_rec, xy)
+    subtitle = (
+        f"C={s.concurrency}, delay={s.dependency_delay_ms}ms, backlog={s.backlog}, "
+        f"arrivals={s.arrival_rate}/s for {s.arrival_seconds:.0f}s, dup={s.duplicate_ratio:.0%}"
+    )
+    return f"""<svg xmlns="http://www.w3.org/2000/svg" width="{_W}" height="{_H}" font-family="sans-serif" role="img"
  aria-label="{title}: backlog over time, measured versus model">
 <rect width="100%" height="100%" fill="#fff"/>
-<text x="{pad}" y="20" font-size="14">{title}</text>
-<text x="{pad}" y="36" font-size="11" fill="#555">C={s.concurrency}, delay={s.dependency_delay_ms}ms,
- backlog={s.backlog}, arrivals={s.arrival_rate}/s for {s.arrival_seconds:.0f}s, dup={s.duplicate_ratio:.0%}</text>
-<line x1="{pad}" y1="{h - pad}" x2="{w - pad}" y2="{h - pad}" stroke="#000"/>
-<line x1="{pad}" y1="{pad}" x2="{pad}" y2="{h - pad}" stroke="#000"/>
-<text x="{w / 2:.0f}" y="{h - 12}" font-size="11" text-anchor="middle">seconds (0 to {t_max:.0f})</text>
-<text x="14" y="{h / 2:.0f}" font-size="11" transform="rotate(-90 14 {h / 2:.0f})" text-anchor="middle">messages
+<text x="{_PAD}" y="20" font-size="14">{title}</text>
+<text x="{_PAD}" y="36" font-size="11" fill="#555">{subtitle}</text>
+<line x1="{_PAD}" y1="{_H - _PAD}" x2="{_W - _PAD}" y2="{_H - _PAD}" stroke="#000"/>
+<line x1="{_PAD}" y1="{_PAD}" x2="{_PAD}" y2="{_H - _PAD}" stroke="#000"/>
+<text x="{_W / 2:.0f}" y="{_H - 12}" font-size="11" text-anchor="middle">seconds (0 to {t_max:.0f})</text>
+<text x="14" y="{_H / 2:.0f}" font-size="11" transform="rotate(-90 14 {_H / 2:.0f})" text-anchor="middle">messages
  (0 to {b_max:.0f})</text>
 <polyline points="{model}" fill="none" stroke="#d62728" stroke-width="1.5" stroke-dasharray="6,4"/>
 <polyline points="{measured}" fill="none" stroke="#1f77b4" stroke-width="2"/>
-{rec}
-<text x="{w - pad - 150}" y="{pad + 12}" font-size="11" fill="#1f77b4">measured</text>
-<text x="{w - pad - 150}" y="{pad + 26}" font-size="11" fill="#d62728">model (lower bound)</text>
+{marker}
+<text x="{_W - _PAD - 150}" y="{_PAD + 12}" font-size="11" fill="#1f77b4">measured</text>
+<text x="{_W - _PAD - 150}" y="{_PAD + 26}" font-size="11" fill="#d62728">model (lower bound)</text>
 </svg>
 """
+
+
+def _polyline(points: Iterable[tuple[float, float]], xy: Callable[[float, float], tuple[float, float]]) -> str:
+    return " ".join(f"{a:.1f},{b:.1f}" for a, b in (xy(t, b) for t, b in points))
+
+
+def _recovery_marker(t_rec: float | None, xy: Callable[[float, float], tuple[float, float]]) -> str:
+    if t_rec is None:
+        return ""
+    rx, _ = xy(t_rec, 0)
+    return (
+        f'<line x1="{rx:.1f}" y1="{_PAD}" x2="{rx:.1f}" y2="{_H - _PAD}" stroke="#888" stroke-dasharray="2,3"/>'
+        f'<text x="{rx + 4:.1f}" y="{_PAD + 12}" font-size="11">recovered {t_rec:.0f}s</text>'
+    )
 
 
 def _model_points(s: Scenario, p: Prediction, t_max: float) -> list[tuple[float, float]]:
@@ -224,34 +294,45 @@ def _model_points(s: Scenario, p: Prediction, t_max: float) -> list[tuple[float,
     return pts
 
 
-def write_results(
-    out_dir: pathlib.Path,
-    *,
-    mode: str,
-    s: Scenario,
-    p: Prediction,
-    samples: list[Sample],
-    obs: Observed,
-    verdict: Verdict,
-    t_rec: float | None,
-    environment: dict,
-) -> pathlib.Path:
+@dataclass(frozen=True)
+class RunResult:
+    """Everything one load run produced. ``write_results`` and the CLIs consume it."""
+
+    mode: str
+    scenario: Scenario
+    prediction: Prediction
+    samples: list[Sample]
+    observed: Observed
+    verdict: Verdict
+    recovered_seconds: float | None
+    environment: dict = field(default_factory=dict)
+
+    def summary_lines(self) -> list[str]:
+        lines = [f"{'PASS' if c.passed else 'FAIL'}  {c.name:22} {c.detail}" for c in self.verdict.checks]
+        measured = f"{self.recovered_seconds:.2f}s" if self.recovered_seconds is not None else "never"
+        lines.append(f"model {self.prediction.recovery_seconds:.2f}s, measured {measured}")
+        return lines
+
+
+def write_results(out_dir: pathlib.Path, r: RunResult) -> pathlib.Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     with (out_dir / "samples.csv").open("w", newline="") as f:
         wr = csv.writer(f)
         wr.writerow(["t_seconds", "visible", "in_flight", "backlog", "dlq", "error"])
-        for x in samples:
+        for x in r.samples:
             wr.writerow([f"{x.t:.2f}", x.visible, x.in_flight, x.backlog, x.dlq, x.error or ""])
+    prediction = {k: (None if isinstance(v, float) and math.isinf(v) else v) for k, v in asdict(r.prediction).items()}
     summary = {
-        "mode": mode,
-        "passed": verdict.passed,
-        "scenario": asdict(s),
-        "prediction": {k: (None if isinstance(v, float) and math.isinf(v) else v) for k, v in asdict(p).items()},
-        "measured_recovery_seconds": t_rec,
-        "observed": asdict(obs),
-        "checks": [asdict(c) for c in verdict.checks],
-        "environment": environment,
+        "mode": r.mode,
+        "passed": r.verdict.passed,
+        "scenario": asdict(r.scenario),
+        "prediction": prediction,
+        "measured_recovery_seconds": r.recovered_seconds,
+        "observed": asdict(r.observed),
+        "checks": [asdict(c) for c in r.verdict.checks],
+        "environment": r.environment,
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str) + "\n")
-    (out_dir / "curve.svg").write_text(render_svg(samples, s, p, t_rec, f"Backlog recovery ({mode})"))
+    svg = render_svg(r.samples, r.scenario, r.prediction, r.recovered_seconds, f"Backlog recovery ({r.mode})")
+    (out_dir / "curve.svg").write_text(svg)
     return out_dir

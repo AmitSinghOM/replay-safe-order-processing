@@ -21,9 +21,98 @@ from orders.adapters.memory import InMemorySqs, InMemoryStore
 from orders.domain import OrderRequest, Status
 from orders.service import OrderService, dependency_delay
 
-from .curve import Observed, Sample, Scenario, evaluate, predict, write_results
+from .curve import (
+    Observed,
+    RunResult,
+    Scenario,
+    count_statuses,
+    evaluate,
+    predict,
+    sample_until_drained,
+    write_results,
+)
 
 SKU = "LOCAL-LT"
+
+
+class _Harness:
+    """Store, queue, service and the counters one local run needs."""
+
+    def __init__(self, s: Scenario) -> None:
+        self.s = s
+        self.store, self.queue = InMemoryStore(), InMemorySqs(max_receive_count=5)
+        self.initial_stock = s.total_orders * s.qty_per_order * 2
+        self.store.set_stock(SKU, self.initial_stock)
+        self.svc = OrderService(self.store, self.queue, faults=dependency_delay(s.dependency_delay_ms))
+        self.req = OrderRequest.parse({"customer_id": "lt-local", "lines": [{"sku": SKU, "qty": s.qty_per_order}]})
+        self.created: list[str] = []
+        self._dup_debt = 0.0
+        self.stop = threading.Event()
+        self.arrivals_done = threading.Event()
+        self._inflight_lock = threading.Lock()
+        self._inflight = 0
+        self.max_inflight = 0
+
+    def submit(self, n: int) -> None:
+        order = self.svc.submit(f"lt-local-{n:08d}", self.req).order
+        self.created.append(order.order_id)
+        self._dup_debt += self.s.duplicate_ratio
+        while self._dup_debt >= 1:  # deterministic duplicate stream
+            self.queue.send({"type": "RESERVE", "order_id": order.order_id})
+            self._dup_debt -= 1
+
+    def worker(self) -> None:
+        while not self.stop.is_set():
+            got = self.queue.receive()
+            if got is None:
+                time.sleep(0.001)
+                continue
+            receipt, body, _ = got
+            self._enter()
+            try:
+                self.svc.process(body)
+            except Exception:  # cqa: ignore=PY-COR-002 reason="same as the Lambda worker: redeliver"
+                self.queue.nack(receipt)
+            else:
+                self.queue.ack(receipt)
+            finally:
+                self._leave()
+
+    def arrivals(self, t0: float) -> None:
+        n, total = self.s.backlog, self.s.total_orders
+        while n < total and not self.stop.is_set():
+            due = self.s.backlog + int(self.s.arrival_rate * (time.monotonic() - t0))
+            while n < min(due, total):
+                self.submit(n)
+                n += 1
+            time.sleep(0.005)
+        self.arrivals_done.set()
+
+    def counts(self) -> tuple[int, int, int]:
+        visible, in_flight = self.queue.counts()
+        return visible, in_flight, self.queue.dlq.depth()
+
+    def observe(self) -> Observed:
+        statuses = [self.store.get_order(o).status for o in self.created]
+        pending, reserved, other = count_statuses(statuses, Status.PENDING, Status.RESERVED)
+        return Observed(
+            max_concurrency=self.max_inflight,
+            orders_created=len(self.created),
+            orders_pending=pending,
+            orders_reserved=reserved,
+            orders_other=other,
+            stock_consumed=self.initial_stock - (self.store.available(SKU) or 0),
+            dlq_final=self.queue.dlq.depth(),
+        )
+
+    def _enter(self) -> None:
+        with self._inflight_lock:
+            self._inflight += 1
+            self.max_inflight = max(self.max_inflight, self._inflight)
+
+    def _leave(self) -> None:
+        with self._inflight_lock:
+            self._inflight -= 1
 
 
 def run_local(
@@ -34,98 +123,28 @@ def run_local(
     overhead_ms: float = 0.2,
     model_tolerance: float | None = 0.5,
     min_run_seconds: float = 1.0,
-):
-    store, queue = InMemoryStore(), InMemorySqs(max_receive_count=5)
-    initial_stock = s.total_orders * s.qty_per_order * 2
-    store.set_stock(SKU, initial_stock)
-    svc = OrderService(store, queue, faults=dependency_delay(s.dependency_delay_ms))
-    req = OrderRequest.parse({"customer_id": "lt-local", "lines": [{"sku": SKU, "qty": s.qty_per_order}]})
-
-    created: list[str] = []
-    dup_debt = 0.0
-
-    def submit(n: int) -> None:
-        nonlocal dup_debt
-        order = svc.submit(f"lt-local-{n:08d}", req).order
-        created.append(order.order_id)
-        dup_debt += s.duplicate_ratio
-        while dup_debt >= 1:  # deterministic duplicate stream
-            queue.send({"type": "RESERVE", "order_id": order.order_id})
-            dup_debt -= 1
-
+) -> RunResult:
+    h = _Harness(s)
     for n in range(s.backlog):
-        submit(n)
-
-    stop = threading.Event()
-    arrivals_done = threading.Event()
-    inflight_lock = threading.Lock()
-    inflight = {"now": 0, "max": 0}
-
-    def worker() -> None:
-        while not stop.is_set():
-            got = queue.receive()
-            if got is None:
-                time.sleep(0.001)
-                continue
-            receipt, body, _ = got
-            with inflight_lock:
-                inflight["now"] += 1
-                inflight["max"] = max(inflight["max"], inflight["now"])
-            try:
-                svc.process(body)
-            except Exception:  # cqa: ignore=PY-COR-002 reason="same as the Lambda worker: redeliver"
-                queue.nack(receipt)
-            else:
-                queue.ack(receipt)
-            finally:
-                with inflight_lock:
-                    inflight["now"] -= 1
+        h.submit(n)
 
     t0 = time.monotonic()
-
-    def arrivals() -> None:
-        n = s.backlog
-        total = s.total_orders
-        while n < total and not stop.is_set():
-            due = s.backlog + int(s.arrival_rate * (time.monotonic() - t0))
-            while n < min(due, total):
-                submit(n)
-                n += 1
-            time.sleep(0.005)
-        arrivals_done.set()
-
-    threads = [threading.Thread(target=worker, daemon=True) for _ in range(s.concurrency)]
-    threads.append(threading.Thread(target=arrivals, daemon=True))
+    threads = [threading.Thread(target=h.worker, daemon=True) for _ in range(s.concurrency)]
+    threads.append(threading.Thread(target=h.arrivals, args=(t0,), daemon=True))
     for th in threads:
         th.start()
-
-    samples: list[Sample] = []
-    zero_streak = 0
-    while True:
-        t = time.monotonic() - t0
-        visible, in_flight = queue.counts()
-        samples.append(Sample(t, visible, in_flight, queue.dlq.depth()))
-        zero_streak = zero_streak + 1 if (visible + in_flight == 0 and arrivals_done.is_set()) else 0
-        if zero_streak >= 3 or t > max_seconds:
-            break
-        time.sleep(sample_every)
-    stop.set()
+    samples = sample_until_drained(
+        h.counts, t0=t0, arrivals_done=h.arrivals_done.is_set, sample_every=sample_every, max_seconds=max_seconds
+    )
+    h.stop.set()
     for th in threads:
         th.join(timeout=5)
 
-    statuses = [store.get_order(o).status for o in created]
-    obs = Observed(
-        max_concurrency=inflight["max"],
-        orders_created=len(created),
-        orders_pending=sum(st is Status.PENDING for st in statuses),
-        orders_reserved=sum(st is Status.RESERVED for st in statuses),
-        orders_other=sum(st not in (Status.PENDING, Status.RESERVED) for st in statuses),
-        stock_consumed=initial_stock - (store.available(SKU) or 0),
-        dlq_final=queue.dlq.depth(),
-    )
+    obs = h.observe()
     p = predict(s, overhead_ms)
     verdict, t_rec = evaluate(s, p, samples, obs, min_run_seconds=min_run_seconds, model_tolerance=model_tolerance)
-    return p, samples, obs, verdict, t_rec
+    env = {"python": platform.python_version(), "machine": platform.machine(), "note": "not AWS evidence"}
+    return RunResult("local-simulation", s, p, samples, obs, verdict, t_rec, env)
 
 
 def main() -> int:
@@ -140,24 +159,10 @@ def main() -> int:
     a = ap.parse_args()
 
     s = Scenario(a.backlog, a.arrival_rate, a.arrival_seconds, a.concurrency, a.delay_ms, a.duplicate_ratio)
-    p, samples, obs, verdict, t_rec = run_local(s)
-    stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
-    out = write_results(
-        a.out / stamp,
-        mode="local-simulation",
-        s=s,
-        p=p,
-        samples=samples,
-        obs=obs,
-        verdict=verdict,
-        t_rec=t_rec,
-        environment={"python": platform.python_version(), "machine": platform.machine(), "note": "not AWS evidence"},
-    )
-    for c in verdict.checks:
-        print(f"{'PASS' if c.passed else 'FAIL'}  {c.name:22} {c.detail}")
-    measured = f"{t_rec:.2f}s" if t_rec is not None else "never"
-    print(f"model {p.recovery_seconds:.2f}s, measured {measured} -> {out}")
-    return 0 if verdict.passed else 1
+    result = run_local(s)
+    out = write_results(a.out / dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ"), result)
+    print("\n".join(result.summary_lines()), "->", out)
+    return 0 if result.verdict.passed else 1
 
 
 if __name__ == "__main__":

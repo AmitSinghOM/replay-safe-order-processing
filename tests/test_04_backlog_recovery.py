@@ -12,7 +12,17 @@ import math
 
 import pytest
 
-from loadtest.curve import Observed, Sample, Scenario, evaluate, predict, recovered_at, render_svg
+from loadtest.curve import (
+    Observed,
+    RunResult,
+    Sample,
+    Scenario,
+    evaluate,
+    predict,
+    recovered_at,
+    render_svg,
+    write_results,
+)
 from loadtest.local_sim import run_local
 from orders.service import FAULT_AFTER_COMMIT, FAULT_BEFORE_COMMIT, dependency_delay
 
@@ -145,15 +155,25 @@ def _local(concurrency: int):
 
 @pytest.mark.slow
 def test_local_run_recovers_with_capped_concurrency_and_no_double_reservation():
-    s, (p, samples, obs, verdict, t_rec) = _local(concurrency=2)
-    assert verdict.passed, [c for c in verdict.checks if not c.passed]
-    assert obs.max_concurrency == 2
-    assert obs.stock_consumed == obs.orders_created  # 10 % duplicates, still once each
-    assert t_rec >= 0.8 * p.recovery_seconds  # the cap really limits throughput
+    _, r = _local(concurrency=2)
+    assert r.verdict.passed, [c for c in r.verdict.checks if not c.passed]
+    assert r.observed.max_concurrency == 2
+    assert r.observed.stock_consumed == r.observed.orders_created  # 10 % duplicates, still once each
+    assert r.recovered_seconds >= 0.8 * r.prediction.recovery_seconds  # the cap really limits throughput
 
 
 @pytest.mark.slow
 def test_raising_the_cap_shortens_recovery():
-    _, (_, _, _, _, t2) = _local(concurrency=2)
-    _, (_, _, _, _, t4) = _local(concurrency=4)
-    assert t4 < t2
+    _, r2 = _local(concurrency=2)
+    _, r4 = _local(concurrency=4)
+    assert r4.recovered_seconds < r2.recovered_seconds
+
+
+def test_write_results_produces_the_three_files(tmp_path):
+    p = predict(S, 10)
+    verdict, t_rec = evaluate(S, p, GOOD, _good_obs(), min_run_seconds=5.0, model_tolerance=None)
+    r = RunResult("unit", S, p, GOOD, _good_obs(), verdict, t_rec, {"note": "test"})
+    out = write_results(tmp_path / "run", r)
+    assert {f.name for f in out.iterdir()} == {"samples.csv", "summary.json", "curve.svg"}
+    assert '"passed": true' in (out / "summary.json").read_text()
+    assert len(r.summary_lines()) == len(verdict.checks) + 1

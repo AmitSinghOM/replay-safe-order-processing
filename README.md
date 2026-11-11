@@ -15,7 +15,7 @@ Design, transaction boundaries and failure matrix: [docs/architecture.md](docs/a
 | Area | State |
 |---|---|
 | Domain, service, handlers | Done |
-| Local failure tests (in-memory + moto + template) | 99 passing |
+| Local failure tests (in-memory + moto + template) | 100 passing |
 | SAM template | Written, not yet deployed |
 | Load test harness (failure 4) | Built; local run passes; AWS run not yet done |
 | Measured AWS cost | Not measured |

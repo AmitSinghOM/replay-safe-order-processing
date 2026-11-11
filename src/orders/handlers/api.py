@@ -12,8 +12,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Callable
 
 from ..domain import (
+    DomainError,
     Event,
     IdempotencyConflict,
     InvalidTransition,
@@ -54,32 +56,59 @@ def _header(event: dict, name: str) -> str | None:
     return None
 
 
+def _create(svc: OrderService, event: dict, _order_id: str | None) -> dict:
+    try:
+        body = json.loads(event.get("body") or "null")
+    except json.JSONDecodeError:
+        raise ValidationError("body is not valid JSON") from None
+    result = svc.submit(_header(event, "Idempotency-Key") or "", OrderRequest.parse(body))
+    return _resp(201 if result.created else 200, result.order.to_dict())
+
+
+def _get(svc: OrderService, _event: dict, order_id: str | None) -> dict:
+    return _resp(200, svc.get(order_id).to_dict())
+
+
+def _cancel(svc: OrderService, _event: dict, order_id: str | None) -> dict:
+    return _resp(200, svc.apply_event(order_id, Event.CANCEL).to_dict())
+
+
+def _confirm(svc: OrderService, _event: dict, order_id: str | None) -> dict:
+    return _resp(200, svc.apply_event(order_id, Event.CONFIRM).to_dict())
+
+
+ROUTES: dict[tuple[str, str], Callable[[OrderService, dict, str | None], dict]] = {
+    ("/orders", "POST"): _create,
+    ("/orders/{order_id}", "GET"): _get,
+    ("/orders/{order_id}/cancel", "POST"): _cancel,
+    ("/orders/{order_id}/confirm", "POST"): _confirm,
+}
+
+# Domain error -> HTTP status. 503 means "the order may be committed; retry with the same key".
+_STATUS_BY_ERROR: tuple[tuple[type[Exception], int, str | None], ...] = (
+    (ValidationError, 400, None),
+    (OrderNotFound, 404, "order not found"),
+    (IdempotencyConflict, 409, None),
+    (InvalidTransition, 409, None),
+    (EnqueueFailed, 503, "temporarily unavailable; retry with the same Idempotency-Key"),
+    (TransientStoreError, 503, "temporarily unavailable; retry with the same Idempotency-Key"),
+)
+
+
 def lambda_handler(event: dict, context: object, service: OrderService | None = None) -> dict:
     svc = service or _default_service()
-    resource = event.get("resource", "")
-    method = event.get("httpMethod", "")
+    route = ROUTES.get((event.get("resource", ""), event.get("httpMethod", "")))
+    if route is None:
+        return _resp(404, {"error": "route not found"})
     order_id = (event.get("pathParameters") or {}).get("order_id")
     try:
-        if resource == "/orders" and method == "POST":
-            try:
-                body = json.loads(event.get("body") or "null")
-            except json.JSONDecodeError:
-                raise ValidationError("body is not valid JSON") from None
-            result = svc.submit(_header(event, "Idempotency-Key") or "", OrderRequest.parse(body))
-            return _resp(201 if result.created else 200, result.order.to_dict())
-        if resource == "/orders/{order_id}" and method == "GET":
-            return _resp(200, svc.get(order_id).to_dict())
-        if resource == "/orders/{order_id}/cancel" and method == "POST":
-            return _resp(200, svc.apply_event(order_id, Event.CANCEL).to_dict())
-        if resource == "/orders/{order_id}/confirm" and method == "POST":
-            return _resp(200, svc.apply_event(order_id, Event.CONFIRM).to_dict())
-        return _resp(404, {"error": "route not found"})
-    except ValidationError as exc:
-        return _resp(400, {"error": str(exc)})
-    except OrderNotFound:
-        return _resp(404, {"error": "order not found"})
-    except (IdempotencyConflict, InvalidTransition) as exc:
-        return _resp(409, {"error": str(exc)})
-    except (EnqueueFailed, TransientStoreError):
-        # The order may be committed. Retrying with the same Idempotency-Key is safe.
-        return _resp(503, {"error": "temporarily unavailable; retry with the same Idempotency-Key"})
+        return route(svc, event, order_id)
+    except (DomainError, EnqueueFailed, TransientStoreError) as exc:
+        return _error_response(exc)
+
+
+def _error_response(exc: Exception) -> dict:
+    for kind, status, message in _STATUS_BY_ERROR:
+        if isinstance(exc, kind):
+            return _resp(status, {"error": message or str(exc)})
+    raise exc  # not a mapped error: let Lambda report it
