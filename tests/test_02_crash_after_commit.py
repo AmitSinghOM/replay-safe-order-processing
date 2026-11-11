@@ -47,12 +47,13 @@ def test_crash_before_commit_leaves_nothing_and_retry_applies_once(service, stor
 class StoreWithoutStatusGuard(InMemoryStore):
     """The bug this design prevents: decrement stock without checking order status."""
 
-    def reserve(self, order_id: str, lines: tuple[Line, ...], now: int) -> ReserveResult:
+    def reserve(self, order_id: str, lines: tuple[Line, ...], now: int, audit) -> ReserveResult:
         with self._lock:
             for l in lines:
                 self._stock[l.sku] -= l.qty
             order = self._orders[order_id]
             order.status = Status.RESERVED
+            self._audit.append(audit)
             return ReserveResult.RESERVED
 
 

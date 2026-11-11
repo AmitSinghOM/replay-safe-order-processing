@@ -9,7 +9,7 @@ dependencies = []
 aws = ["boto3==1.35.99"]  # Lambda runtime ships boto3; needed locally for scripts/ only
 
 [dependency-groups]
-dev = ["pytest==8.3.4", "ruff==0.8.4", "boto3==1.35.99", "moto[dynamodb,sqs]==5.0.26"]
+dev = ["pytest==8.3.4", "ruff==0.8.4", "boto3==1.35.99", "moto[dynamodb,sqs]==5.0.26", "pyyaml==6.0.2"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]

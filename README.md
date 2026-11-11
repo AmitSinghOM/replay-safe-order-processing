@@ -15,7 +15,7 @@ Design, transaction boundaries and failure matrix: [docs/architecture.md](docs/a
 | Area | State |
 |---|---|
 | Domain, service, handlers | Done |
-| Local failure tests (in-memory + moto) | 80 passing |
+| Local failure tests (in-memory + moto + template) | 99 passing |
 | SAM template | Written, not yet deployed |
 | Load test harness (failure 4) | Built; local run passes; AWS run not yet done |
 | Measured AWS cost | Not measured |
@@ -42,7 +42,9 @@ make loadtest-local  # backlog-recovery run on in-memory adapters
 | Message keeps failing -> DLQ -> replay | `tests/test_03_dlq_replay.py` |
 | Dependency slows down | `tests/test_04_backlog_recovery.py`; AWS curve: [docs/loadtest.md](docs/loadtest.md) |
 | Unexpected events | `tests/test_05_state_transitions.py` |
+| Who may re-send a message (client retry, reconciler, operator) | `tests/test_06_dispatch_marker.py` |
 | Same cases on the DynamoDB adapter | `tests/test_aws_adapter.py` (moto) |
+| Template invariants | `tests/test_template.py` |
 
 ## Deploy (not yet run)
 

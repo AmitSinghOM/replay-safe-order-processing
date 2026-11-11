@@ -138,6 +138,10 @@ class Order:
     created_at: int
     updated_at: int
     reason: str | None = None
+    # False until the RESERVE message is known to be in the queue. Only undispatched
+    # orders are ever re-sent (by a client retry or the reconciler). Any status
+    # change also clears it: the worker could only have acted on a delivered message.
+    dispatched: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -150,6 +154,14 @@ class Order:
             "updated_at": self.updated_at,
             "reason": self.reason,
         }
+
+
+def scoped_idempotency_key(customer_id: str, key: str) -> str:
+    """Idempotency keys are scoped per customer, like API keys at payment providers.
+
+    ``key`` cannot contain ``#`` (see ``_IDEMPOTENCY_KEY_RE``), so the join is unambiguous.
+    """
+    return f"{customer_id}#{key}"
 
 
 @dataclass(frozen=True)

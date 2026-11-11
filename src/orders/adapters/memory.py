@@ -33,7 +33,7 @@ class InMemoryStore:
             if order.order_id in self._orders:
                 raise RuntimeError("order id collision")
             self._idem[record.key] = record
-            self._orders[order.order_id] = copy.deepcopy(order)
+            self._orders[order.order_id] = replace(copy.deepcopy(order), dispatched=False)
             return None
 
     def get_idempotency(self, key: str) -> IdempotencyRecord | None:
@@ -45,7 +45,18 @@ class InMemoryStore:
             order = self._orders.get(order_id)
             return copy.deepcopy(order) if order else None
 
-    def reserve(self, order_id: str, lines: tuple[Line, ...], now: int) -> ReserveResult:
+    def mark_dispatched(self, order_id: str) -> None:
+        with self._lock:
+            order = self._orders.get(order_id)
+            if order is not None:
+                self._orders[order_id] = replace(order, dispatched=True)
+
+    def list_undispatched(self, created_before: int, limit: int) -> list[str]:
+        with self._lock:
+            hits = [o for o in self._orders.values() if not o.dispatched and o.created_at < created_before]
+            return [o.order_id for o in sorted(hits, key=lambda o: (o.created_at, o.order_id))[:limit]]
+
+    def reserve(self, order_id: str, lines: tuple[Line, ...], now: int, audit: AuditEntry) -> ReserveResult:
         with self._lock:
             order = self._orders.get(order_id)
             if order is None or order.status is not Status.PENDING:
@@ -54,7 +65,10 @@ class InMemoryStore:
                 return ReserveResult.INSUFFICIENT_STOCK
             for l in lines:
                 self._stock[l.sku] -= l.qty
-            self._orders[order_id] = replace(order, status=Status.RESERVED, version=order.version + 1, updated_at=now)
+            self._orders[order_id] = replace(
+                order, status=Status.RESERVED, version=order.version + 1, updated_at=now, dispatched=True
+            )
+            self._audit.append(audit)  # same atomic unit as the effect
             return ReserveResult.RESERVED
 
     def transition(self, order_id: str, expected: Status, to: Status, now: int, reason: str | None = None) -> bool:
@@ -63,7 +77,12 @@ class InMemoryStore:
             if order is None or order.status is not expected:
                 return False
             self._orders[order_id] = replace(
-                order, status=to, version=order.version + 1, updated_at=now, reason=reason or order.reason
+                order,
+                status=to,
+                version=order.version + 1,
+                updated_at=now,
+                reason=reason or order.reason,
+                dispatched=True,
             )
             return True
 
@@ -77,14 +96,9 @@ class InMemoryStore:
                 for l in current.lines:
                     self._stock[l.sku] += l.qty
             self._orders[order.order_id] = replace(
-                current, status=Status.CANCELLED, version=current.version + 1, updated_at=now
+                current, status=Status.CANCELLED, version=current.version + 1, updated_at=now, dispatched=True
             )
             return CancelResult.CANCELLED
-
-    def list_by_status(self, status: Status, created_before: int, limit: int) -> list[Order]:
-        with self._lock:
-            hits = [o for o in self._orders.values() if o.status is status and o.created_at < created_before]
-            return [copy.deepcopy(o) for o in sorted(hits, key=lambda o: o.created_at)[:limit]]
 
     def append_audit(self, entry: AuditEntry) -> None:
         with self._lock:

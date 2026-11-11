@@ -72,6 +72,11 @@ make loadtest-aws ARGS="--backlog 2000 --arrival-rate 2 --arrival-seconds 300 --
 make loadtest-delete
 ```
 
+The reconciler is deployed in the load-test stack too. It only re-sends
+orders still marked UNSENT, so a preloaded backlog older than 300 s is left
+alone and the curve measures the worker, not the reconciler
+(`tests/test_06_dispatch_marker.py::test_reconciler_does_not_resend_a_backlog_that_is_merely_waiting`).
+
 Safety rails in `loadtest/aws_run.py`:
 
 - Refuses unless the stack is tagged `purpose=loadtest`.

@@ -32,7 +32,7 @@ class TransientStoreError(Exception):
 
 class OrderStore(Protocol):
     def create_order(self, order: Order, record: IdempotencyRecord, now: int) -> IdempotencyRecord | None:
-        """Write order + idempotency record atomically.
+        """Write order + idempotency record atomically. The order starts undispatched.
 
         Returns None when written. Returns the existing LIVE record when the key
         is already held (nothing written). An expired record may be replaced.
@@ -43,17 +43,21 @@ class OrderStore(Protocol):
     def get_order(self, order_id: str) -> Order | None:
         """Strongly consistent read."""
 
-    def reserve(self, order_id: str, lines: tuple[Line, ...], now: int) -> ReserveResult:
-        """Atomically: status PENDING->RESERVED (condition) and decrement each sku (condition available>=qty)."""
+    def mark_dispatched(self, order_id: str) -> None:
+        """Record that the RESERVE message is in the queue. Idempotent."""
+
+    def list_undispatched(self, created_before: int, limit: int) -> list[str]:
+        """Order ids whose message may never have been sent. Eventually consistent; reconciler only."""
+
+    def reserve(self, order_id: str, lines: tuple[Line, ...], now: int, audit: AuditEntry) -> ReserveResult:
+        """Atomically: status PENDING->RESERVED (condition), decrement each sku
+        (condition available>=qty) and write the audit row. All or nothing."""
 
     def transition(self, order_id: str, expected: Status, to: Status, now: int, reason: str | None = None) -> bool:
         """Conditional status change with no stock effect. False if status != expected."""
 
     def cancel(self, order: Order, now: int) -> CancelResult:
         """Cancel from ``order.status``; if RESERVED, release its stock in the same transaction."""
-
-    def list_by_status(self, status: Status, created_before: int, limit: int) -> list[Order]:
-        """Eventually consistent; used only by the reconciler."""
 
     def append_audit(self, entry: AuditEntry) -> None: ...
 

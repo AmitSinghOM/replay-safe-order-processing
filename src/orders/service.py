@@ -14,7 +14,7 @@ import logging
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from .domain import (
     AuditEntry,
@@ -27,6 +27,7 @@ from .domain import (
     OrderRequest,
     Status,
     next_status,
+    scoped_idempotency_key,
     validate_idempotency_key,
 )
 from .ports import CancelResult, DeadLetterQueue, OrderStore, Queue, ReserveResult, TransientStoreError
@@ -38,6 +39,7 @@ DEFAULT_IDEMPOTENCY_WINDOW_S = 24 * 3600
 # Named fault points. Production passes no injector; tests raise at these points.
 FAULT_BEFORE_COMMIT = "worker.before_commit"
 FAULT_AFTER_COMMIT = "worker.after_commit"  # state committed, message not yet acked
+FAULT_AFTER_SEND = "api.after_send"  # message queued, order not yet marked dispatched
 
 FaultInjector = Callable[[str], None]
 
@@ -127,23 +129,25 @@ class OrderService:
             created_at=now,
             updated_at=now,
         )
-        record = IdempotencyRecord(key, fingerprint, order.order_id, expires_at=now + self.window)
+        scoped = scoped_idempotency_key(request.customer_id, key)
+        record = IdempotencyRecord(scoped, fingerprint, order.order_id, expires_at=now + self.window)
 
         held = self.store.create_order(order, record, now)
         if held is None:
             self._audit(order.order_id, "CREATED", now, idempotency_key=key)
-            self._enqueue(order)
-            return SubmitResult(order=order, created=True)
+            self._dispatch(order.order_id)
+            return SubmitResult(order=replace(order, dispatched=True), created=True)
 
         if held.request_fingerprint != fingerprint:
             raise IdempotencyConflict("Idempotency-Key was already used with a different request")
         existing = self.store.get_order(held.order_id)
         if existing is None:  # should not happen: both items are written in one transaction
             raise OrderNotFound(held.order_id)
-        if existing.status is Status.PENDING:
-            # The first attempt may have committed but failed to enqueue. Re-sending
-            # is safe because the worker is duplicate-safe.
-            self._enqueue(existing)
+        if not existing.dispatched:
+            # The first attempt committed but its message may never have been sent.
+            # Re-sending is safe because the worker is duplicate-safe.
+            self._dispatch(existing.order_id)
+            existing = replace(existing, dispatched=True)
         return SubmitResult(order=existing, created=False)
 
     def get(self, order_id: str) -> Order:
@@ -182,12 +186,11 @@ class OrderService:
         order = self.get(order_id)
         now = self._now()
 
+        audit = AuditEntry(order_id, "RESERVED", now, {"message_id": message.get("_message_id")})
         self.faults(FAULT_BEFORE_COMMIT)
-        result = self.store.reserve(order_id, order.lines, now)
-
+        result = self.store.reserve(order_id, order.lines, now, audit)  # effect + audit row, one transaction
         if result is ReserveResult.RESERVED:
-            self._audit(order_id, "RESERVED", now, message_id=message.get("_message_id"))
-            self.faults(FAULT_AFTER_COMMIT)
+            self.faults(FAULT_AFTER_COMMIT)  # nothing of ours runs between commit and ack except this
             return WorkOutcome.RESERVED
 
         if result is ReserveResult.INSUFFICIENT_STOCK:
@@ -255,24 +258,37 @@ class OrderService:
             dlq.delete(msg.receipt)
         return report
 
-    def reconcile_stale_pending(self, older_than_s: int = 300, limit: int = 100) -> list[str]:
-        """Backstop for the commit-then-enqueue gap: re-send PENDING orders that look stuck."""
+    def reconcile_undispatched(self, older_than_s: int = 300, limit: int = 1000) -> list[str]:
+        """Backstop for the commit-then-enqueue gap: send orders whose message may never have left.
+
+        Only undispatched orders qualify. Orders waiting in a backlog or sitting in
+        the DLQ are dispatched, so this never re-sends them; DLQ replay stays an
+        explicit, audited operator action.
+        """
         now = self._now()
         resent = []
-        for order in self.store.list_by_status(Status.PENDING, now - older_than_s, limit):
-            self._enqueue(order)
-            self._audit(order.order_id, "RECONCILE_REENQUEUE", now)
-            resent.append(order.order_id)
+        for order_id in self.store.list_undispatched(now - older_than_s, limit):
+            self._dispatch(order_id)
+            self._audit(order_id, "RECONCILE_REENQUEUE", now)
+            resent.append(order_id)
         return resent
 
     # ---- helpers ----------------------------------------------------------
 
-    def _enqueue(self, order: Order) -> None:
+    def _dispatch(self, order_id: str) -> None:
+        """Send the RESERVE message, then record that it is in the queue.
+
+        If the send fails the order stays undispatched (client retry or reconciler
+        re-sends). If the send succeeds but marking fails, one extra message goes
+        out later; the worker's status guard makes that harmless.
+        """
         try:
-            self.queue.send({"type": Event.RESERVE.value, "order_id": order.order_id})
+            self.queue.send({"type": Event.RESERVE.value, "order_id": order_id})
         except Exception as exc:  # noqa: BLE001 - surfaced as a typed retryable error
-            log.warning("enqueue failed for %s: %s", order.order_id, exc)
-            raise EnqueueFailed(order.order_id) from exc
+            log.warning("enqueue failed for %s: %s", order_id, exc)
+            raise EnqueueFailed(order_id) from exc
+        self.faults(FAULT_AFTER_SEND)
+        self.store.mark_dispatched(order_id)
 
     def _audit(self, subject: str, action: str, at: int, **detail: object) -> None:
         self.store.append_audit(AuditEntry(subject=subject, action=action, at=at, detail=detail))

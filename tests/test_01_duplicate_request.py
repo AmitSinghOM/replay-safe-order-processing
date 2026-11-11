@@ -23,7 +23,8 @@ def test_same_key_same_body_returns_the_same_order(service, store, queue):
     assert second.order.order_id == first.order.order_id
     assert store.order_count() == 1
 
-    drain(queue, service)  # two RESERVE messages were sent (one per submit while PENDING)
+    assert queue.depth() == 1  # the second submit did not send another RESERVE
+    drain(queue, service)
     assert store.get_order(first.order.order_id).status is Status.RESERVED
     assert store.available("WIDGET") == 8  # reserved once, not twice
 
@@ -91,7 +92,7 @@ def test_reconciler_recovers_an_order_whose_client_never_retried(service, store,
     with pytest.raises(EnqueueFailed):
         service.submit(KEY, request())
     clock.advance(301)
-    assert service.reconcile_stale_pending(older_than_s=300) == ["order-1"]
+    assert service.reconcile_undispatched(older_than_s=300) == ["order-1"]
     drain(queue, service)
     assert store.get_order("order-1").status is Status.RESERVED
 

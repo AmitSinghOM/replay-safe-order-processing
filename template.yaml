@@ -53,11 +53,13 @@ Resources:
         - { AttributeName: pk, KeyType: HASH }
         - { AttributeName: sk, KeyType: RANGE }
       GlobalSecondaryIndexes:
+        # Sparse "not yet sent" index: only orders whose RESERVE message may be
+        # missing carry gsi1pk/gsi1sk. The reconciler reads it; it is normally empty.
         - IndexName: gsi1
           KeySchema:
             - { AttributeName: gsi1pk, KeyType: HASH }
             - { AttributeName: gsi1sk, KeyType: RANGE }
-          Projection: { ProjectionType: ALL }
+          Projection: { ProjectionType: KEYS_ONLY }
       TimeToLiveSpecification:
         AttributeName: expires_at
         Enabled: true
@@ -150,6 +152,21 @@ Resources:
         Every5Min:
           Type: Schedule
           Properties: { Schedule: rate(5 minutes) }
+
+  QueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Oldest order message is older than 10 minutes; the worker is down, throttled or too slow.
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - { Name: QueueName, Value: !GetAtt OrdersQueue.QueueName }
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 600
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
 
   DlqNotEmptyAlarm:
     Type: AWS::CloudWatch::Alarm

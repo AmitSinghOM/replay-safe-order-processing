@@ -3,8 +3,9 @@
 Item layout (sk is always ``META`` except audit rows):
 
     ORDER#<id>   status, customer_id, lines, version, created_at, updated_at, reason,
-                 gsi1pk=STATUS#<status>, gsi1sk=<created_at>
-    IDEMP#<key>  request_fingerprint, order_id, expires_at   (TTL attribute: expires_at)
+                 gsi1pk=UNSENT + gsi1sk=<created_at> ONLY while the RESERVE message
+                 may not be in the queue (sparse index; removed on dispatch or any status change)
+    IDEMP#<customer_id>#<key>  request_fingerprint, order_id, expires_at   (TTL attribute: expires_at)
     SKU#<sku>    available
     AUDIT#<subj> sk=<at>#<uuid>, action, detail (JSON)
 
@@ -22,6 +23,7 @@ from ..domain import AuditEntry, IdempotencyRecord, Line, Order, Status
 from ..ports import CancelResult, DlqMessage, ReserveResult, TransientStoreError
 
 _META = "META"
+_UNSENT = "UNSENT"  # gsi1pk value; the index holds only orders whose message may not be queued
 _RETRYABLE_REASONS = {"TransactionConflict", "ThrottlingError", "ProvisionedThroughputExceeded"}
 
 
@@ -80,7 +82,17 @@ class DynamoStore:
             created_at=int(item["created_at"]["N"]),
             updated_at=int(item["updated_at"]["N"]),
             reason=item.get("reason", {}).get("S"),
+            dispatched="gsi1pk" not in item,  # the sparse-index key IS the "not yet sent" marker
         )
+
+    def _audit_item(self, entry: AuditEntry) -> dict:
+        return {
+            "pk": {"S": f"AUDIT#{entry.subject}"},
+            "sk": {"S": f"{entry.at:012d}#{uuid.uuid4()}"},
+            "action": {"S": entry.action},
+            "at": _n(entry.at),
+            "detail": {"S": json.dumps(entry.detail, sort_keys=True, default=str)},
+        }
 
     # -- OrderStore ------------------------------------------------------------
 
@@ -113,7 +125,8 @@ class DynamoStore:
                             "version": _n(order.version),
                             "created_at": _n(order.created_at),
                             "updated_at": _n(order.updated_at),
-                            "gsi1pk": {"S": f"STATUS#{order.status.value}"},
+                            # Sparse index: present only while the RESERVE message may be unsent.
+                            "gsi1pk": {"S": _UNSENT},
                             "gsi1sk": _n(order.created_at),
                         },
                         "ConditionExpression": "attribute_not_exists(pk)",
@@ -145,19 +158,46 @@ class DynamoStore:
         item = self.ddb.get_item(TableName=self.table, Key=_order_key(order_id), ConsistentRead=True).get("Item")
         return self._to_order(item) if item else None
 
+    def mark_dispatched(self, order_id: str) -> None:
+        # REMOVE of an absent attribute is a no-op, so repeats are harmless.
+        self.ddb.update_item(
+            TableName=self.table,
+            Key=_order_key(order_id),
+            UpdateExpression="REMOVE gsi1pk, gsi1sk",
+            ConditionExpression="attribute_exists(pk)",
+        )
+
+    def list_undispatched(self, created_before: int, limit: int) -> list[str]:
+        ids: list[str] = []
+        kwargs = {
+            "TableName": self.table,
+            "IndexName": "gsi1",
+            "KeyConditionExpression": "gsi1pk = :p AND gsi1sk < :t",
+            "ExpressionAttributeValues": {":p": {"S": _UNSENT}, ":t": _n(created_before)},
+            "Limit": min(limit, 100),
+        }
+        while len(ids) < limit:
+            resp = self.ddb.query(**kwargs)
+            ids += [i["pk"]["S"].removeprefix("ORDER#") for i in resp.get("Items", [])]
+            if "LastEvaluatedKey" not in resp:
+                break
+            kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+        return ids[:limit]
+
     def _status_update(self, order_id: str, expected: Status, to: Status, now: int, reason: str | None) -> dict:
         names = {"#s": "status"}
         values = {
             ":expected": {"S": expected.value},
             ":to": {"S": to.value},
-            ":gsi": {"S": f"STATUS#{to.value}"},
             ":now": _n(now),
             ":one": _n(1),
         }
-        update = "SET #s = :to, gsi1pk = :gsi, updated_at = :now, version = version + :one"
+        update = "SET #s = :to, updated_at = :now, version = version + :one"
         if reason:
             update += ", reason = :reason"
             values[":reason"] = {"S": reason}
+        # Any status change proves the message was delivered, so drop the unsent marker too.
+        update += " REMOVE gsi1pk, gsi1sk"
         return {
             "Update": {
                 "TableName": self.table,
@@ -190,15 +230,17 @@ class DynamoStore:
             }
         }
 
-    def reserve(self, order_id: str, lines: tuple[Line, ...], now: int) -> ReserveResult:
+    def reserve(self, order_id: str, lines: tuple[Line, ...], now: int, audit: AuditEntry) -> ReserveResult:
+        # 1 status update + <= MAX_LINES stock updates + 1 audit put = at most 12 of the 100 allowed items.
         items = [self._status_update(order_id, Status.PENDING, Status.RESERVED, now, None)]
         items += [self._stock_update(l, -1) for l in lines]
+        items.append({"Put": {"TableName": self.table, "Item": self._audit_item(audit)}})
         codes = self._transact(items)
         if codes is None:
             return ReserveResult.RESERVED
         if codes[0] == "ConditionalCheckFailed":
             return ReserveResult.ORDER_NOT_PENDING
-        if any(c == "ConditionalCheckFailed" for c in codes[1:]):
+        if any(c == "ConditionalCheckFailed" for c in codes[1:-1]):
             return ReserveResult.INSUFFICIENT_STOCK
         raise RuntimeError(f"reserve cancelled: {codes}")
 
@@ -223,27 +265,8 @@ class DynamoStore:
             return CancelResult.STATE_CHANGED
         raise RuntimeError(f"cancel cancelled: {codes}")
 
-    def list_by_status(self, status: Status, created_before: int, limit: int) -> list[Order]:
-        resp = self.ddb.query(
-            TableName=self.table,
-            IndexName="gsi1",
-            KeyConditionExpression="gsi1pk = :p AND gsi1sk < :t",
-            ExpressionAttributeValues={":p": {"S": f"STATUS#{status.value}"}, ":t": _n(created_before)},
-            Limit=limit,
-        )
-        return [self._to_order(i) for i in resp.get("Items", [])]
-
     def append_audit(self, entry: AuditEntry) -> None:
-        self.ddb.put_item(
-            TableName=self.table,
-            Item={
-                "pk": {"S": f"AUDIT#{entry.subject}"},
-                "sk": {"S": f"{entry.at:012d}#{uuid.uuid4()}"},
-                "action": {"S": entry.action},
-                "at": _n(entry.at),
-                "detail": {"S": json.dumps(entry.detail, sort_keys=True, default=str)},
-            },
-        )
+        self.ddb.put_item(TableName=self.table, Item=self._audit_item(entry))
 
     def audit_log(self, subject: str) -> list[AuditEntry]:
         resp = self.ddb.query(
