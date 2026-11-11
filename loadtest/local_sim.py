@@ -73,7 +73,7 @@ def run_local(
                 inflight["max"] = max(inflight["max"], inflight["now"])
             try:
                 svc.process(body)
-            except Exception:  # noqa: BLE001 - same as the Lambda worker: redeliver
+            except Exception:  # cqa: ignore=PY-COR-002 reason="same as the Lambda worker: redeliver"
                 queue.nack(receipt)
             else:
                 queue.ack(receipt)

@@ -8,6 +8,8 @@ minutes with no operator and no reason. These tests pin the fix.
 
 from __future__ import annotations
 
+import pytest
+
 from orders.adapters.memory import drain
 from orders.domain import Status
 from orders.ports import TransientStoreError
@@ -45,10 +47,8 @@ def test_reconciler_does_not_resend_a_backlog_that_is_merely_waiting(service, st
 
 def test_reconciler_sends_only_orders_whose_send_failed(service, store, queue, clock):
     queue.fail_sends = 1
-    try:
+    with pytest.raises(EnqueueFailed):
         service.submit("mark-key-0201", request())
-    except EnqueueFailed:
-        pass
     service.submit("mark-key-0202", request())  # this one was sent
     clock.advance(301)
 
@@ -68,10 +68,8 @@ def test_idempotent_retry_of_a_sent_pending_order_sends_nothing(service, queue):
 
 def test_send_ok_but_mark_fails_gives_one_duplicate_and_one_reservation(service, store, queue, faults, clock):
     faults.arm(FAULT_AFTER_SEND, MarkFailed)
-    try:
+    with pytest.raises(MarkFailed):
         service.submit("mark-key-0401", request())
-    except MarkFailed:
-        pass
     assert queue.depth() == 1 and not store.get_order("order-1").dispatched
 
     clock.advance(301)
@@ -84,10 +82,8 @@ def test_send_ok_but_mark_fails_gives_one_duplicate_and_one_reservation(service,
 
 def test_any_status_change_clears_the_marker(service, store, queue, faults):
     faults.arm(FAULT_AFTER_SEND, MarkFailed)
-    try:
+    with pytest.raises(MarkFailed):
         service.submit("mark-key-0501", request())
-    except MarkFailed:
-        pass
     assert not store.get_order("order-1").dispatched
     drain(queue, service)  # the message was in the queue after all
     assert store.get_order("order-1").status is Status.RESERVED
@@ -97,10 +93,8 @@ def test_any_status_change_clears_the_marker(service, store, queue, faults):
 def test_reconciler_pages_past_the_first_hundred(service, store, queue, clock):
     queue.fail_sends = 150
     for n in range(150):
-        try:
+        with pytest.raises(EnqueueFailed):
             service.submit(f"mark-key-1{n:03d}", request())
-        except EnqueueFailed:
-            pass
     clock.advance(301)
     assert len(service.reconcile_undispatched(older_than_s=300, limit=1000)) == 150
     assert queue.depth() == 150

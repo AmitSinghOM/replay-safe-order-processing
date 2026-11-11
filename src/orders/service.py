@@ -284,7 +284,7 @@ class OrderService:
         """
         try:
             self.queue.send({"type": Event.RESERVE.value, "order_id": order_id})
-        except Exception as exc:  # noqa: BLE001 - surfaced as a typed retryable error
+        except Exception as exc:  # cqa: ignore=PY-COR-002 reason="wrapped as typed EnqueueFailed"
             log.warning("enqueue failed for %s: %s", order_id, exc)
             raise EnqueueFailed(order_id) from exc
         self.faults(FAULT_AFTER_SEND)

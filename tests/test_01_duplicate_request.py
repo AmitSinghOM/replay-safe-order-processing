@@ -59,7 +59,7 @@ def test_concurrent_duplicates_create_one_order(service, store):
         barrier.wait()
         try:
             results.append(service.submit(KEY, request()))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # cqa: ignore=PY-COR-002 reason="collected and asserted empty"
             errors.append(exc)
 
     threads = [threading.Thread(target=submit) for _ in range(20)]

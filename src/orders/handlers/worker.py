@@ -41,7 +41,7 @@ def lambda_handler(event: dict, context: object, service: OrderService | None = 
             body = json.loads(record["body"])
             outcome = svc.process({**body, "_message_id": message_id})
             log.info(json.dumps({"message_id": message_id, "order_id": body.get("order_id"), "outcome": outcome.value}))
-        except Exception as exc:  # noqa: BLE001 - any failure means "redeliver this record"
+        except Exception as exc:  # cqa: ignore=PY-COR-002 reason="any failure means redeliver"
             log.warning(json.dumps({"message_id": message_id, "error": type(exc).__name__, "detail": str(exc)}))
             failures.append({"itemIdentifier": message_id})
     return {"batchItemFailures": failures}

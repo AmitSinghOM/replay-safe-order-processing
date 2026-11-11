@@ -28,7 +28,8 @@ _Cfn.add_multi_constructor("!", _tag)
 
 @pytest.fixture(scope="module")
 def t() -> dict:
-    return yaml.load(TEMPLATE.read_text(), Loader=_Cfn)
+    # _Cfn extends SafeLoader; the only extra constructor builds plain dicts for CFN tags.
+    return yaml.load(TEMPLATE.read_text(), Loader=_Cfn)  # cqa: ignore=PY-SEC-001 reason="SafeLoader subclass"
 
 
 def test_queue_visibility_is_six_times_worker_timeout(t):

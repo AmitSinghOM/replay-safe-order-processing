@@ -251,7 +251,7 @@ def main() -> int:
                 dlq_vis, dlq_nv = queue_counts(sqs, dlq_url)
                 samples.append(Sample(t, vis, nv, dlq_vis + dlq_nv))
                 zero_streak = zero_streak + 1 if (vis + nv == 0 and arrivals_done.is_set()) else 0
-            except Exception as exc:  # noqa: BLE001 - recorded and counted as a failing sample
+            except Exception as exc:  # cqa: ignore=PY-COR-002 reason="recorded as a failing sample"
                 samples.append(Sample(t, 0, 0, 0, error=f"{type(exc).__name__}: {exc}"))
                 zero_streak = 0
             print(f"t={t:7.1f}s backlog={samples[-1].backlog} dlq={samples[-1].dlq}", file=sys.stderr)

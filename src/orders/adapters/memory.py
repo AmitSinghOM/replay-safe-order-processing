@@ -224,7 +224,7 @@ def drain(queue: InMemorySqs, service, max_deliveries: int = 1000) -> list:
         receipt, body, _count = got
         try:
             outcomes.append(service.process(body))
-        except Exception as exc:  # noqa: BLE001 - any failure means "not acked"
+        except Exception as exc:  # cqa: ignore=PY-COR-002 reason="mirrors the Lambda worker: not acked"
             outcomes.append(exc)
             queue.nack(receipt)
         else:
