@@ -81,3 +81,7 @@ Deletes the table (and its data), both queues, functions, API and alarm.
 ## Out of scope
 
 Storefront UI, real payments, multi-region, AI assistant.
+
+## License
+
+[MIT](LICENSE).
