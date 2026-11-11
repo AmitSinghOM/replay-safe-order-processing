@@ -15,9 +15,9 @@ Design, transaction boundaries and failure matrix: [docs/architecture.md](docs/a
 | Area | State |
 |---|---|
 | Domain, service, handlers | Done |
-| Local failure tests (in-memory + moto) | 60 passing |
+| Local failure tests (in-memory + moto) | 80 passing |
 | SAM template | Written, not yet deployed |
-| Load test / backlog-recovery curve | Not started |
+| Load test harness (failure 4) | Built; local run passes; AWS run not yet done |
 | Measured AWS cost | Not measured |
 
 Synthetic tests do not show production adoption.
@@ -27,8 +27,10 @@ Synthetic tests do not show production adoption.
 Needs [uv](https://docs.astral.sh/uv/).
 
 ```sh
-make test   # uv run --python 3.12 pytest
+make test            # uv run --python 3.12 pytest
+make test-fast       # skip the timing-based load runs
 make lint
+make loadtest-local  # backlog-recovery run on in-memory adapters
 ```
 
 ## Failure evidence
@@ -38,7 +40,7 @@ make lint
 | Same request twice | `tests/test_01_duplicate_request.py` |
 | Crash after commit, before ack | `tests/test_02_crash_after_commit.py` |
 | Message keeps failing -> DLQ -> replay | `tests/test_03_dlq_replay.py` |
-| Dependency slows down | not yet; needs deployed load test |
+| Dependency slows down | `tests/test_04_backlog_recovery.py`; AWS curve: [docs/loadtest.md](docs/loadtest.md) |
 | Unexpected events | `tests/test_05_state_transitions.py` |
 | Same cases on the DynamoDB adapter | `tests/test_aws_adapter.py` (moto) |
 
@@ -69,6 +71,7 @@ Audit rows land under `pk = AUDIT#replay`.
 
 ```sh
 make delete STACK=replay-safe-orders
+make loadtest-delete   # if you deployed the load-test stack
 ```
 
 Deletes the table (and its data), both queues, functions, API and alarm.

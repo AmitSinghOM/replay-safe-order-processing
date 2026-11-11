@@ -5,3 +5,5 @@ __pycache__/
 .ruff_cache/
 .aws-sam/
 samconfig.toml
+# local simulation output is reproducible; AWS results under results/aws are evidence and get committed
+results/local/

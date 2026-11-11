@@ -46,6 +46,26 @@ def _no_faults(_point: str) -> None:
     return None
 
 
+MAX_DEPENDENCY_DELAY_MS = 1500  # keeps a 10-record batch inside the 30 s worker timeout
+
+
+def dependency_delay(ms: int, sleep: Callable[[float], None] = time.sleep) -> FaultInjector:
+    """Stand-in for a slow downstream call, placed just before the commit.
+
+    Load tests only. Set by stack parameter, never by request data.
+    """
+    if not 0 <= ms <= MAX_DEPENDENCY_DELAY_MS:
+        raise ValueError(f"dependency delay must be 0-{MAX_DEPENDENCY_DELAY_MS} ms")
+    if ms == 0:
+        return _no_faults
+
+    def inject(point: str) -> None:
+        if point == FAULT_BEFORE_COMMIT:
+            sleep(ms / 1000)
+
+    return inject
+
+
 class EnqueueFailed(Exception):
     """Order committed but the message was not sent. Client retry or the reconciler re-sends."""
 

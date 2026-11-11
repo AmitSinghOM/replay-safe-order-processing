@@ -15,6 +15,12 @@ Parameters:
   IdempotencyWindowSeconds:
     Type: Number
     Default: 86400
+  DependencyDelayMs:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 1500 # 10 records x 1.5 s stays inside the 30 s worker timeout
+    Description: Load tests only. Simulated slow dependency inside the worker, before the commit.
 
 Globals:
   Function:
@@ -67,7 +73,7 @@ Resources:
   OrdersQueue:
     Type: AWS::SQS::Queue
     Properties:
-      VisibilityTimeout: 60 # >= 6x worker timeout, per AWS guidance for SQS event sources
+      VisibilityTimeout: 180 # 6x the 30 s worker timeout, per AWS guidance for SQS event sources
       SqsManagedSseEnabled: true
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt OrdersDLQ.Arn
@@ -114,6 +120,10 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Handler: orders.handlers.worker.lambda_handler
+      Timeout: 30
+      Environment:
+        Variables:
+          DEPENDENCY_DELAY_MS: !Ref DependencyDelayMs
       Policies:
         - DynamoDBCrudPolicy: { TableName: !Ref OrdersTable }
       Events:
@@ -165,3 +175,5 @@ Outputs:
     Value: !Ref OrdersQueue
   DeadLetterQueueUrl:
     Value: !Ref OrdersDLQ
+  WorkerFunctionName:
+    Value: !Ref WorkerFunction

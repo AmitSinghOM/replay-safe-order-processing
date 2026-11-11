@@ -10,7 +10,7 @@ import json
 import logging
 import os
 
-from ..service import OrderService
+from ..service import OrderService, dependency_delay
 
 log = logging.getLogger()
 log.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -23,7 +23,12 @@ def _default_service() -> OrderService:
     if _service is None:
         from ..adapters.aws import DynamoStore, SqsQueue
 
-        _service = OrderService(DynamoStore(os.environ["TABLE_NAME"]), SqsQueue(os.environ["QUEUE_URL"]))
+        _service = OrderService(
+            DynamoStore(os.environ["TABLE_NAME"]),
+            SqsQueue(os.environ["QUEUE_URL"]),
+            # Load-test knob for failure 4. Default 0 = no delay.
+            faults=dependency_delay(int(os.environ.get("DEPENDENCY_DELAY_MS", "0"))),
+        )
     return _service
 
 

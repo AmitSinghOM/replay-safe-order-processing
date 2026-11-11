@@ -12,9 +12,10 @@ aws = ["boto3==1.35.99"]  # Lambda runtime ships boto3; needed locally for scrip
 dev = ["pytest==8.3.4", "ruff==0.8.4", "boto3==1.35.99", "moto[dynamodb,sqs]==5.0.26"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 testpaths = ["tests"]
 addopts = "-q"
+markers = ["slow: timing-based local load runs (a few seconds)"]
 filterwarnings = ["ignore:datetime.datetime.utcnow:DeprecationWarning:botocore"]
 
 [tool.ruff]

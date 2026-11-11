@@ -78,7 +78,7 @@ RESERVE that arrives after CANCEL is acked and audited as `RESERVE_IGNORED`.
 | 1 | Same request twice | Idempotency record in the create transaction; 24 h window; fingerprint of normalized body | `tests/test_01_duplicate_request.py` (incl. 20 concurrent submits) |
 | 2 | Crash after commit, before ack | Conditional reserve on `status = PENDING` | `tests/test_02_crash_after_commit.py` (incl. a guard-removed store that double-reserves) |
 | 3 | Message keeps failing | `maxReceiveCount` 5 -> DLQ -> alarm -> `scripts/replay_dlq.py` (audit row before send; settled orders skipped) | `tests/test_03_dlq_replay.py` |
-| 4 | Dependency slows down | Event-source `MaximumConcurrency` + API throttling | **Not measured yet.** Needs a deployed load test |
+| 4 | Dependency slows down | Event-source `MaximumConcurrency` + API throttling; delay knob before the commit | `tests/test_04_backlog_recovery.py` + local run; AWS curve via `loadtest/aws_run.py`, **not yet run** ([loadtest.md](loadtest.md)) |
 | 5 | Unexpected events | Explicit transition table; conditional writes; re-read on lost race | `tests/test_05_state_transitions.py` |
 
 `tests/test_aws_adapter.py` re-runs cases 1, 2 and 5 against moto to check

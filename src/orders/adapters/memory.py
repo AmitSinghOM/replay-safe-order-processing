@@ -162,6 +162,11 @@ class InMemorySqs:
         with self._lock:
             return len(self._ready) + len(self._inflight)
 
+    def counts(self) -> tuple[int, int]:
+        """(visible, in flight), like SQS ApproximateNumberOfMessages / ...NotVisible."""
+        with self._lock:
+            return len(self._ready), len(self._inflight)
+
 
 class InMemoryDlq:
     def __init__(self) -> None:
