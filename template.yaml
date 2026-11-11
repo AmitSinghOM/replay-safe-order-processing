@@ -1,0 +1,167 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Replay-safe order processing (API Gateway, Lambda, SQS + DLQ, DynamoDB)
+
+Parameters:
+  WorkerMaxConcurrency:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    Description: SQS event-source maximum concurrency (AWS minimum is 2). Caps load on slow dependencies.
+  MaxReceiveCount:
+    Type: Number
+    Default: 5
+    Description: Deliveries before a message is moved to the DLQ.
+  IdempotencyWindowSeconds:
+    Type: Number
+    Default: 86400
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    CodeUri: src/
+    MemorySize: 256
+    Timeout: 10
+    LoggingConfig:
+      LogFormat: JSON
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref OrdersTable
+        QUEUE_URL: !Ref OrdersQueue
+        LOG_LEVEL: INFO
+
+Resources:
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete # demo stack: `sam delete` removes data too
+    UpdateReplacePolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+        - { AttributeName: gsi1pk, AttributeType: S }
+        - { AttributeName: gsi1sk, AttributeType: N }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: gsi1
+          KeySchema:
+            - { AttributeName: gsi1pk, KeyType: HASH }
+            - { AttributeName: gsi1sk, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  OrdersDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600 # 14 days
+      SqsManagedSseEnabled: true
+
+  OrdersQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 60 # >= 6x worker timeout, per AWS guidance for SQS event sources
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrdersDLQ.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+
+  OrdersApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: v1
+      # Service-to-service callers sign with SigV4. No anonymous access.
+      Auth:
+        DefaultAuthorizer: AWS_IAM
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingRateLimit: 50
+          ThrottlingBurstLimit: 100
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: orders.handlers.api.lambda_handler
+      Environment:
+        Variables:
+          IDEMPOTENCY_WINDOW_S: !Ref IdempotencyWindowSeconds
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref OrdersTable }
+        - SQSSendMessagePolicy: { QueueName: !GetAtt OrdersQueue.QueueName }
+      Events:
+        CreateOrder:
+          Type: Api
+          Properties: { RestApiId: !Ref OrdersApi, Path: /orders, Method: post }
+        GetOrder:
+          Type: Api
+          Properties: { RestApiId: !Ref OrdersApi, Path: "/orders/{order_id}", Method: get }
+        CancelOrder:
+          Type: Api
+          Properties: { RestApiId: !Ref OrdersApi, Path: "/orders/{order_id}/cancel", Method: post }
+        ConfirmOrder:
+          Type: Api
+          Properties: { RestApiId: !Ref OrdersApi, Path: "/orders/{order_id}/confirm", Method: post }
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: orders.handlers.worker.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref OrdersTable }
+      Events:
+        Orders:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OrdersQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            ScalingConfig:
+              MaximumConcurrency: !Ref WorkerMaxConcurrency
+
+  ReconcileFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: orders.handlers.reconcile.lambda_handler
+      Environment:
+        Variables:
+          STALE_AFTER_S: "300"
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref OrdersTable }
+        - SQSSendMessagePolicy: { QueueName: !GetAtt OrdersQueue.QueueName }
+      Events:
+        Every5Min:
+          Type: Schedule
+          Properties: { Schedule: rate(5 minutes) }
+
+  DlqNotEmptyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Messages are in the order DLQ; run scripts/replay_dlq.py after fixing the cause.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - { Name: QueueName, Value: !GetAtt OrdersDLQ.QueueName }
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  ApiUrl:
+    Value: !Sub "https://${OrdersApi}.execute-api.${AWS::Region}.amazonaws.com/v1"
+  TableName:
+    Value: !Ref OrdersTable
+  QueueUrl:
+    Value: !Ref OrdersQueue
+  DeadLetterQueueUrl:
+    Value: !Ref OrdersDLQ

@@ -1,0 +1,78 @@
+# Replay-Safe Order Processing on AWS
+
+Async order intake that can retry and replay failed work without reserving
+inventory twice.
+
+API Gateway -> Python Lambda -> SQS (+ DLQ) -> Lambda worker -> DynamoDB. One IaC tool: AWS SAM.
+
+**Claim:** duplicate-safe effects inside a DynamoDB transaction boundary.
+**Not claimed:** exactly-once delivery. SQS delivers at least once.
+
+Design, transaction boundaries and failure matrix: [docs/architecture.md](docs/architecture.md).
+
+## Status
+
+| Area | State |
+|---|---|
+| Domain, service, handlers | Done |
+| Local failure tests (in-memory + moto) | 60 passing |
+| SAM template | Written, not yet deployed |
+| Load test / backlog-recovery curve | Not started |
+| Measured AWS cost | Not measured |
+
+Synthetic tests do not show production adoption.
+
+## Run locally
+
+Needs [uv](https://docs.astral.sh/uv/).
+
+```sh
+make test   # uv run --python 3.12 pytest
+make lint
+```
+
+## Failure evidence
+
+| Failure | Test file |
+|---|---|
+| Same request twice | `tests/test_01_duplicate_request.py` |
+| Crash after commit, before ack | `tests/test_02_crash_after_commit.py` |
+| Message keeps failing -> DLQ -> replay | `tests/test_03_dlq_replay.py` |
+| Dependency slows down | not yet; needs deployed load test |
+| Unexpected events | `tests/test_05_state_transitions.py` |
+| Same cases on the DynamoDB adapter | `tests/test_aws_adapter.py` (moto) |
+
+## Deploy (not yet run)
+
+Needs AWS SAM CLI and credentials for a sandbox account.
+
+```sh
+make deploy STACK=replay-safe-orders
+```
+
+The API uses `AWS_IAM` auth. Calls must be SigV4-signed by a principal with
+`execute-api:Invoke` on the stack's API.
+
+## DLQ replay
+
+```sh
+# dry run: audits each message, changes nothing
+make replay-dry-run OPERATOR=<you> REASON="<incident / cause fixed>"
+# execute
+uv run --python 3.12 --extra aws python scripts/replay_dlq.py \
+  --stack replay-safe-orders --operator <you> --reason "<why>" --execute
+```
+
+Audit rows land under `pk = AUDIT#replay`.
+
+## Teardown
+
+```sh
+make delete STACK=replay-safe-orders
+```
+
+Deletes the table (and its data), both queues, functions, API and alarm.
+
+## Out of scope
+
+Storefront UI, real payments, multi-region, AI assistant.
